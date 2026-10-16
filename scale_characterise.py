@@ -143,9 +143,14 @@ def plan_repeatability(load, n):
                   dict(kind='load', label=f'#{i+1} place {load} centred', load=load)]
     return steps
 
-def plan_eccentricity(load):
+def plan_eccentricity(load, recentre=True):
+    """cg-18 order; with recentre the load goes back to the centre after every corner, so each corner
+    can be compared with the centre readings just before and after it (cancels drift)"""
+    order = [ECC_POSITIONS[0]]
+    for p in ECC_POSITIONS[1:]:
+        order += [p] + ([ECC_POSITIONS[0]] if recentre else [])
     steps = []
-    for p in ECC_POSITIONS:
+    for p in order:
         steps += [dict(kind='zero', label=f'{p}: empty pan'),
                   dict(kind='load', label=f'{p}: place {load} at {p.split(" ",1)[1]}', load=load, pos=p)]
     return steps
@@ -206,11 +211,31 @@ def evaluate(test, steps, weights, d):
         L.append(f'adjustment accuracy (largest deviation from conventional mass) = {dev*1000:+.3f} mg'
                  f'  (weight U {U*1000:.3f} mg)')
     elif test == 'eccentricity':
-        c = pairs[0][1]; devs = [(s['pos'], n - c) for s, n in pairs]
-        worst = max(devs, key=lambda t: abs(t[1]))
-        r.update(max_dev=worst[1], devs=devs)
-        for p, dv in devs: L.append(f'{p:16s} net {c + dv:.4f} g   deviation {dv*1000:+.3f} mg')
-        L.append(f'eccentricity: max deviation from centre = {worst[1]*1000:+.3f} mg at {worst[0]}')
+        centre = ECC_POSITIONS[0]
+        cidx = [k for k, (s, n) in enumerate(pairs) if s['pos'] == centre]
+        recentred = len(cidx) > 1
+        devs = []
+        for k, (s, n) in enumerate(pairs):
+            if s['pos'] == centre: continue
+            before = [pairs[j][1] for j in cidx if j < k][-1:]
+            after = [pairs[j][1] for j in cidx if j > k][:1]
+            refs = before + after if recentred else [pairs[cidx[0]][1]] if cidx else []
+            if not refs: continue
+            ref = statistics.mean(refs)
+            devs.append((s['pos'], n, ref, n - ref))
+        if not devs:
+            L.append('no corner readings'); return r
+        worst = max(devs, key=lambda t: abs(t[3]))
+        cn = [pairs[j][1] for j in cidx]
+        r.update(max_dev=worst[3], devs=[(p, dv) for p, _, _, dv in devs], centre=cn, recentred=recentred)
+        for p, n, ref, dv in devs:
+            L.append(f'{p:16s} net {n:.4f} g   centre {"(mean of before/after) " if recentred else ""}{ref:.4f} g'
+                     f'   deviation {dv*1000:+.3f} mg')
+        if recentred:
+            L.append('centre readings: ' + ', '.join(f'{x:.4f}' for x in cn) +
+                     f' g  (drift over the test {(cn[-1] - cn[0])*1000:+.3f} mg, spread {(max(cn) - min(cn))*1000:.3f} mg)')
+        L.append(f'eccentricity: max deviation from centre = {worst[3]*1000:+.3f} mg at {worst[0]}'
+                 + ('  (drift-corrected)' if recentred else ''))
     elif test == 'indication':
         rows = []
         for s, n in pairs:
@@ -387,7 +412,9 @@ def gui(args):
     rep_n.set('10'); ttk.Label(f, text='repetitions').grid(row=1, column=0, sticky='w'); rep_n.grid(row=1, column=1, sticky='w')
     f = tab('eccentricity', 'Eccentricity')
     ecc_load = entry(f, 0, 'load (≥ Max/3)', '2kgA')
-    ttk.Label(f, text='positions: centre, front left, rear left, rear right, front right', foreground='gray').grid(row=1, column=0, columnspan=2, sticky='w')
+    ecc_recentre = tk.BooleanVar(value=True)
+    ttk.Checkbutton(f, text='back to the centre after every corner (cancels drift)', variable=ecc_recentre).grid(row=1, column=0, columnspan=2, sticky='w')
+    ttk.Label(f, text='positions: centre, front left, rear left, rear right, front right', foreground='gray').grid(row=2, column=0, columnspan=2, sticky='w')
     f = tab('indication', 'Error of indication')
     ind_loads = entry(f, 0, 'loads, separated by ;', '1kg; 2kgA; 1kg + 2kgA; 2kgA + 2kgB', 48)
     ttk.Label(f, text='cg-18: 5 points (0, ¼, ½, ¾, Max) or 11; zero is read before each load', foreground='gray').grid(row=1, column=0, columnspan=2, sticky='w')
@@ -423,7 +450,7 @@ def gui(args):
             if name == 'repeatability':
                 parse_load(rep_load.get(), st['weights']); plan = plan_repeatability(rep_load.get().strip(), int(rep_n.get()))
             elif name == 'eccentricity':
-                parse_load(ecc_load.get(), st['weights']); plan = plan_eccentricity(ecc_load.get().strip())
+                parse_load(ecc_load.get(), st['weights']); plan = plan_eccentricity(ecc_load.get().strip(), ecc_recentre.get())
             elif name == 'indication':
                 loads = [x.strip() for x in ind_loads.get().split(';') if x.strip()]
                 for l in loads: parse_load(l, st['weights'])

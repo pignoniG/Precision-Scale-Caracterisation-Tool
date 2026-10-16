@@ -16,7 +16,7 @@ balance, not an accredited calibration: it reports the measured quantities, not 
 | Test | Procedure | Result |
 |---|---|---|
 | **Repeatability** | the same load placed 5, 6 or 10 times, pan read empty before each placement | standard deviation `s`; adjustment accuracy = largest deviation from the conventional mass |
-| **Eccentricity** | one load at centre, front left, rear left, rear right, front right, unloading in between (cg-18 option 3) | largest deviation from the centre reading |
+| **Eccentricity** | one load at centre, front left, rear left, rear right, front right, unloading in between (cg-18 option 3); by default the load goes back to the centre after every corner | largest deviation from the centre; with the extra centre placements each corner is compared with the mean of the centre readings before and after it, which cancels drift |
 | **Error of indication** | increasing loads with unloading in between (cg-18: 5 points 0, ¼, ½, ¾, Max, or 11) | error `E = indication - conventional mass` for each point, and the deviation from a straight line through zero and the top load |
 | **Linearity, tare-load method** | the same test load placed on tares of about 0, 1, 2, 3 × the test load | linearity curve that does not depend on knowing the test weight's mass ("testing with unknown weights") |
 | **ABBA comparison** | reference A and test mass B in A-B-B-A cycles | mean difference B - A with its standard deviation and the standard uncertainty of the mean; with a calibrated A, the mass of B |
