@@ -32,6 +32,12 @@ recorded value is the mean of that stable stretch (at most the last 3 s). Record
 your hands stay free for the weights, or manual with **Record now**. **Undo step** and **Skip** are there
 for mistakes.
 
+Automatic recording also waits for the *right* load: an empty-pan step must read near the previous empty
+pan, a load step near that empty-pan reading plus the conventional mass of the named weights (window ±1 %
+of the load, at least 0.5 g, adjustable). Tares have no known mass, so a tare step only needs something on
+the pan and some movement since the prompt. The expected reading is shown while waiting; **Record now**
+still records anything, but marks implausible values in the log.
+
 **Weights.** Enter each weight with its nominal value, its conventional value from the calibration
 certificate and its expanded uncertainty `U`. Loads are written as names joined by `+`
 (`2kgA + 2kgB`) or as a number in grams. The uncertainties of combined weights are added linearly,

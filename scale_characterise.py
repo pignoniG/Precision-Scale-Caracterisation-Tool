@@ -58,13 +58,18 @@ class SimSource(threading.Thread):
     def __init__(self, out=None, d=0.001):
         super().__init__(daemon=True)
         self.out = out or queue.Queue(); self.running = True; self.d = d
-        self.load_g = 0.0; self.shown = 0.0; self.drift = 0.0; self.last_load = 0.0; self.t_change = 0
+        self._load = 0.0; self.shown = 0.0; self.drift = 0.0; self.t_change = 0
+
+    @property
+    def load_g(self): return self._load
+
+    @load_g.setter
+    def load_g(self, g):                       # any handling counts as a disturbance, even an equal mass
+        self._load = g; self.t_change = time.time(); self.shown -= 0.05
 
     def run(self):
         while self.running:
             time.sleep(0.05)                       # 20 lines/s so demos run quickly
-            if self.load_g != self.last_load:
-                self.last_load = self.load_g; self.t_change = time.time()
             self.drift += random.gauss(0, 0.00003)
             target = self.load_g * (1 + 2e-6) + 0.000004 * self.load_g ** 2 / 4000 + self.drift
             self.shown += (target - self.shown) * 0.35
@@ -363,10 +368,11 @@ def gui(args):
     # ---------------- recording settings
     rs = ttk.LabelFrame(left, text='Recording', padding=6); rs.pack(fill='x')
     settle = tk.DoubleVar(value=12.0); tol = tk.DoubleVar(value=2.0); avg = tk.DoubleVar(value=3.0)
-    auto = tk.BooleanVar(value=True)
-    for i, (t, v) in enumerate((('stable for [s]', settle), ('within [d]', tol), ('average last [s]', avg))):
+    auto = tk.BooleanVar(value=True); plaus = tk.DoubleVar(value=1.0)
+    for i, (t, v) in enumerate((('stable for [s]', settle), ('within [d]', tol), ('average last [s]', avg),
+                                ('expected within ± [% of load]', plaus))):
         ttk.Label(rs, text=t).grid(row=i, column=0, sticky='w'); ttk.Entry(rs, textvariable=v, width=8).grid(row=i, column=1)
-    ttk.Checkbutton(rs, text='record automatically when stable', variable=auto).grid(row=3, column=0, columnspan=2, sticky='w')
+    ttk.Checkbutton(rs, text='record automatically when stable\nand close to the expected value', variable=auto).grid(row=4, column=0, columnspan=2, sticky='w')
 
     # ---------------- tests
     nb = ttk.Notebook(right); nb.pack(fill='x')
@@ -466,9 +472,51 @@ def gui(args):
         else:
             text = f'{s["label"]}'
             sim_load = parse_load(s['load'], st['weights'])[0] + sim_mass(s.get('tare'))
-        if isinstance(st['source'], SimSource): st['source'].load_g = sim_load
+        if isinstance(st['source'], SimSource):
+            if args.demo_slow:                 # self-test: the operator changes the load 4 s late
+                root.after(4000, lambda L=sim_load: setattr(st['source'], 'load_g', L))
+            else:
+                st['source'].load_g = sim_load
         instr.config(text=text); prog.config(text=f'step {i+1} of {len(p)}  -  {st["test"]}')
-        st['recorded_t'] = time.time()
+        st['recorded_t'] = time.time(); st['moved'] = False
+
+    def expected():
+        """(expected reading, window) for the current step, or None when it cannot be predicted (tares).
+        Empty pan: the previous empty-pan reading (0 at first). Load: the empty-pan or tare reading just
+        recorded plus the conventional mass of the named weights. Window: ±plaus % of the load, >= 0.5 g."""
+        p, i = st['plan'], st['idx']
+        if p is None or i >= len(p): return None
+        s = p[i]
+        if s['kind'] == 'tare': return None
+        ref = None
+        for k in range(i - 1, -1, -1):
+            if p[k]['kind'] in ('zero', 'tare') and 'value' in p[k]:
+                ref = p[k]['value']; break
+            if s['kind'] == 'load' and p[k]['kind'] in ('zero', 'tare'):
+                break                                   # its own zero/tare was skipped: no reference
+        mass = None
+        for k in list(range(i, len(p))) + list(range(i - 1, -1, -1)):   # this step's load, else the nearest one
+            if p[k]['kind'] == 'load':
+                mass = parse_load(p[k]['load'], st['weights'])[0]; break
+        win = max(abs(mass or 0) * plaus.get() / 100, 0.5)
+        if s['kind'] == 'zero':
+            return (ref if ref is not None else 0.0), win
+        if ref is None and any(q['kind'] == 'tare' for q in p):
+            return None                                 # load on an unknown tare without its tare reading
+        return (ref or 0.0) + parse_load(s['load'], st['weights'])[0], win
+
+    def plausible(v):
+        e = expected()
+        if e is not None:
+            return abs(v - e[0]) <= e[1]
+        p, i = st['plan'], st['idx']
+        if p is None or i >= len(p): return True
+        s = p[i]
+        if s['kind'] == 'tare':                         # unknown object: the pan must hold something new
+            if not s.get('tare'):
+                return abs(v) <= 0.5                    # "no tare" = empty pan
+            return abs(v) > 0.5 and st.get('moved', False)   # something was moved since the prompt
+        return True
 
     def record(manual=False):
         p, i = st['plan'], st['idx']
@@ -479,7 +527,9 @@ def gui(args):
         st['stepw'].writerow([datetime.datetime.now().isoformat(timespec='seconds'), st['test'], i + 1, s['kind'],
                               s['label'], s.get('load', s.get('tare', '')), f'{v:.5f}', f'{s["stable_s"]:.1f}'])
         st['stepf'].flush()
-        say(f'  {s["label"]:45s} {v:12.4f} g' + ('  (manual)' if manual else ''))
+        e = expected()
+        flag = '' if plausible(v) else f'  (!) far from the expected {e[0]:.3f} g'
+        say(f'  {s["label"]:45s} {v:12.4f} g' + ('  (manual)' if manual else '') + flag)
         root.bell(); st['idx'] += 1; show_step()
 
     def back():
@@ -510,7 +560,8 @@ def gui(args):
         meta = {k: e.get() for k, e in fields.items()}
         with open(os.path.join(st['folder'], 'session.json'), 'w') as f:
             json.dump(dict(balance=meta, weights=st['weights'], results=st['results'],
-                           settings=dict(settle_s=settle.get(), tol_d=tol.get(), avg_s=avg.get())), f, indent=1, default=str)
+                           settings=dict(settle_s=settle.get(), tol_d=tol.get(), avg_s=avg.get(),
+                                         plausibility_pct=plaus.get())), f, indent=1, default=str)
         with open(os.path.join(st['folder'], 'report.txt'), 'w') as f:
             f.write(f'Balance characterisation - {datetime.datetime.now():%Y-%m-%d %H:%M}\n')
             for k, v in meta.items(): f.write(f'{k:18s}: {v}\n')
@@ -536,6 +587,8 @@ def gui(args):
                     say('serial error: ' + ev[1]); continue
                 _, t, txt = ev
                 res = live.feed(t, txt)
+                if res and res[1] != 'S' and t > st['recorded_t']:
+                    st['moved'] = True
                 if st['raw']:
                     st['raw'].writerow([datetime.datetime.fromtimestamp(t).isoformat(timespec='milliseconds'),
                                         res[1] if res else 'other', res[2] if res else '', res[3] if res else '', txt])
@@ -547,9 +600,13 @@ def gui(args):
             d = float(fields['d [g]'].get() or 0.001)
             sf = live.stable_for(tol.get() * d)
             stab_lbl.config(text=f'stable {sf:4.1f} s' if s == 'S' else 'moving')
-            if (st['plan'] is not None and auto.get() and st['idx'] < len(st['plan'])
-                    and time.time() - st['recorded_t'] > 2 and sf >= settle.get()):
-                record()
+            if st['plan'] is not None and st['idx'] < len(st['plan']):
+                e = expected(); ok = plausible(v)
+                base = f'step {st["idx"]+1} of {len(st["plan"])}  -  {st["test"]}'
+                prog.config(text=base + ('' if e is None else
+                            f'   expected ≈ {e[0]:.3f} g' + ('' if ok else '  - waiting for the right load')))
+                if auto.get() and ok and time.time() - st['recorded_t'] > 2 and sf >= settle.get():
+                    record()
         if st['rawf']: st['rawf'].flush()
         root.after(100, poll)
     poll()
@@ -583,6 +640,7 @@ def main():
     ap.add_argument('--demo', choices=['repeatability', 'eccentricity', 'indication', 'tare_linearity', 'abba'],
                     help=argparse.SUPPRESS)
     ap.add_argument('--shot', help=argparse.SUPPRESS)
+    ap.add_argument('--demo-slow', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--shot-after', type=float, default=10, help=argparse.SUPPRESS)
     gui(ap.parse_args())
 
