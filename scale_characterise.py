@@ -25,6 +25,9 @@ Run:  python3 scale_characterise.py         (--simulate for a demo without a bal
 import argparse, csv, datetime, json, math, os, queue, random, re, statistics, sys, threading, time
 
 LINE = re.compile(r'^\s*(S|SD|SI|SIR)?\s*([-+]?\d+(?:\.\d+)?)\s*(\S+)?\s*$')
+# optional temperature line from a patched Mettler ROM: 'T 297904' = the balance's raw temperature count
+TLINE = re.compile(r'^\s*T\s+(\d+)\s*$')
+COUNTS_PER_C = 2000          # Mettler service manual 4.2.7: count difference / 2000 = temperature difference in C
 ECC_POSITIONS = ['1 centre', '2 front left', '3 rear left', '4 rear right', '5 front right']
 
 
@@ -59,6 +62,7 @@ class SimSource(threading.Thread):
         super().__init__(daemon=True)
         self.out = out or queue.Queue(); self.running = True; self.d = d
         self._load = 0.0; self.shown = 0.0; self.drift = 0.0; self.t_change = 0
+        self.temp = 297904; self.t_temp = 0
 
     @property
     def load_g(self): return self._load
@@ -76,6 +80,9 @@ class SimSource(threading.Thread):
             v = round(self.shown + random.gauss(0, 0.0004), 3)
             st = 'S' if time.time() - self.t_change > 0.8 else 'SD'
             self.out.put(('line', time.time(), f'{st:4s}{v:10.3f} g'))
+            if time.time() - self.t_temp > 2:
+                self.t_temp = time.time(); self.temp += random.randint(-3, 6)
+                self.out.put(('line', self.t_temp, f'T {self.temp}'))
 
     def stop(self): self.running = False
 
@@ -296,7 +303,7 @@ def gui(args):
     root = tk.Tk(); root.title('Balance characterisation')
     q = queue.Queue(); live = Live()
     st = dict(source=None, raw=None, rawf=None, plan=None, idx=0, test=None, steps=[], results=[],
-              folder=None, weights={}, recorded_t=0)
+              folder=None, weights={}, recorded_t=0, temp=None, temp0=None, ref=None)
 
     # ---------------- session folder and files
     def ensure_session():
@@ -308,7 +315,7 @@ def gui(args):
         st['raw'] = csv.writer(st['rawf']); st['raw'].writerow(['time', 'status', 'value', 'unit', 'line'])
         stepf = open(os.path.join(st['folder'], 'steps.csv'), 'w', newline='')
         st['stepf'] = stepf; st['stepw'] = csv.writer(stepf)
-        st['stepw'].writerow(['time', 'test', 'step', 'kind', 'label', 'load', 'value_g', 'stable_s'])
+        st['stepw'].writerow(['time', 'test', 'step', 'kind', 'label', 'load', 'value_g', 'stable_s', 'temp_count', 'temp'])
         folder_lbl.config(text=st['folder'])
 
     # ---------------- top: connection and live reading
@@ -327,7 +334,7 @@ def gui(args):
     sim = tk.BooleanVar(value=args.simulate)
     ttk.Checkbutton(top, text='simulate', variable=sim).pack(side='left')
     def connect():
-        disconnect()
+        disconnect(); st['temp'] = st['temp0'] = None; show_temp(False)
         try:
             src = SimSource(q) if sim.get() else SerialSource(port.get(), int(baud.get()), par.get(), q)
         except Exception as e:
@@ -338,6 +345,7 @@ def gui(args):
     conn_btn = ttk.Button(top, text='Connect', command=connect); conn_btn.pack(side='left', padx=6)
     reading = ttk.Label(top, text='---', font=('Menlo', 26)); reading.pack(side='right')
     stab_lbl = ttk.Label(top, text='', width=22); stab_lbl.pack(side='right', padx=8)
+    temp_lbl = ttk.Label(top, text='', width=30, font=('Menlo', 12))      # shown once a T line arrives
 
     body = ttk.Frame(root, padding=6); body.pack(fill='both', expand=True)
     left = ttk.Frame(body); left.pack(side='left', fill='y')
@@ -351,6 +359,33 @@ def gui(args):
                                 ('operator', ''), ('notes', '')]):
         ttk.Label(info, text=k).grid(row=i, column=0, sticky='w')
         e = ttk.Entry(info, width=22); e.insert(0, v); e.grid(row=i, column=1, pady=1); fields[k] = e
+
+    # ---------------- temperature (needs the patched ROM that sends 'T nnnnnn' lines)
+    tb = ttk.LabelFrame(left, text='Temperature (balance count)', padding=6)   # shown once a T line arrives
+    cpc = tk.StringVar(value=str(COUNTS_PER_C)); tnow = tk.StringVar()
+    ttk.Label(tb, text='counts per °C').grid(row=0, column=0, sticky='w')
+    ttk.Entry(tb, textvariable=cpc, width=8).grid(row=0, column=1, sticky='w')
+    ttk.Label(tb, text='thermometer [°C]').grid(row=1, column=0, sticky='w')
+    ttk.Entry(tb, textvariable=tnow, width=8).grid(row=1, column=1, sticky='w')
+    def set_ref():
+        try: st['ref'] = (st['temp'][1], float(tnow.get().replace(',', '.')))
+        except (TypeError, ValueError): messagebox.showinfo('Temperature', 'Wait for a T line and enter the thermometer reading first.')
+    ttk.Button(tb, text='Set reference', command=set_ref).grid(row=1, column=2, padx=4)
+    ttk.Label(tb, text='without a reference only changes are shown (Δ °C since the first T line)',
+              foreground='gray').grid(row=2, column=0, columnspan=3, sticky='w')
+    def temp_c(count):
+        """(text, number) for a count: absolute °C once a reference is set, else the change since the first count."""
+        try: k = float(cpc.get().replace(',', '.')) or COUNTS_PER_C
+        except ValueError: k = COUNTS_PER_C
+        if st['ref']: return f'{st["ref"][1] + (count - st["ref"][0]) / k:.2f} °C'
+        if st['temp0'] is not None: return f'Δ {(count - st["temp0"]) / k:+.2f} °C'
+        return ''
+
+    def show_temp(on):
+        if on:
+            temp_lbl.pack(side='right', padx=8); tb.pack(fill='x', pady=(6, 0), after=info)
+        else:
+            temp_lbl.pack_forget(); tb.pack_forget()
 
     # ---------------- weights
     wf = ttk.LabelFrame(left, text='Test weights (conventional values)', padding=6); wf.pack(fill='x', pady=6)
@@ -551,8 +586,10 @@ def gui(args):
         v = live.value(avg.get(), tol.get() * float(fields['d [g]'].get() or 0.001)); s = p[i]
         s['value'] = v; s['time'] = time.time()
         s['stable_s'] = live.stable_for(tol.get() * float(fields['d [g]'].get() or 0.001))
+        s['temp_count'] = st['temp'][1] if st['temp'] else None
         st['stepw'].writerow([datetime.datetime.now().isoformat(timespec='seconds'), st['test'], i + 1, s['kind'],
-                              s['label'], s.get('load', s.get('tare', '')), f'{v:.5f}', f'{s["stable_s"]:.1f}'])
+                              s['label'], s.get('load', s.get('tare', '')), f'{v:.5f}', f'{s["stable_s"]:.1f}',
+                              st['temp'][1] if st['temp'] else '', temp_c(st['temp'][1]) if st['temp'] else ''])
         st['stepf'].flush()
         e = expected()
         flag = '' if plausible(v) else f'  (!) far from the expected {e[0]:.3f} g'
@@ -585,6 +622,9 @@ def gui(args):
     def save(silent=False):
         ensure_session()
         meta = {k: e.get() for k, e in fields.items()}
+        if st['temp0'] is not None:
+            meta['temperature count first / last'] = f'{st["temp0"]} / {st["temp"][1]}'
+            meta['temperature change'] = temp_c(st['temp'][1]) if not st['ref'] else f'{temp_c(st["temp"][1])} (reference {st["ref"][1]:g} °C at count {st["ref"][0]})'
         with open(os.path.join(st['folder'], 'session.json'), 'w') as f:
             json.dump(dict(balance=meta, weights=st['weights'], results=st['results'],
                            settings=dict(settle_s=settle.get(), tol_d=tol.get(), avg_s=avg.get(),
@@ -613,6 +653,15 @@ def gui(args):
                 if ev[0] == 'error':
                     say('serial error: ' + ev[1]); continue
                 _, t, txt = ev
+                tm = TLINE.match(txt)
+                if tm:
+                    st['temp'] = (t, int(tm.group(1)))
+                    if st['temp0'] is None:
+                        st['temp0'] = st['temp'][1]; show_temp(True)
+                    if st['raw']:
+                        st['raw'].writerow([datetime.datetime.fromtimestamp(t).isoformat(timespec='milliseconds'),
+                                            'T', st['temp'][1], '', txt])
+                    continue
                 res = live.feed(t, txt)
                 if res and res[1] != 'S' and t > st['recorded_t']:
                     st['moved'] = True
@@ -621,6 +670,8 @@ def gui(args):
                                         res[1] if res else 'other', res[2] if res else '', res[3] if res else '', txt])
         except queue.Empty:
             pass
+        if st['temp']:
+            temp_lbl.config(text=f'T {st["temp"][1]}  {temp_c(st["temp"][1])}')
         if live.last:
             _, s, v, u = live.last
             reading.config(text=f'{s:2s} {v:10.3f} {u}')

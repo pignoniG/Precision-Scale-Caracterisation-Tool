@@ -91,6 +91,16 @@ regular but unreadable characters, and the RS-232 voltage can damage it.
 
 The PC side is then 9600 baud, 7 data bits, even parity, 1 stop bit, no flow control.
 
+### Temperature (optional)
+
+A Mettler balance measures its own temperature for the compensation, but does not normally send it. With
+a ROM patched to send a line `T 297904` (the raw count the service keypad shows), the GUI shows the
+count and the temperature next to the weight, writes the count to `raw.csv` (status `T`) and to every step
+in `steps.csv`, and puts the first and last count in the report. The service manual converts counts at
+2000 per °C (`counts per °C`, editable). The count has no known zero, so by default the GUI shows the
+change since the first reading; type a thermometer reading and press **Set reference** to get absolute °C.
+Balances that don't send `T` lines are unaffected.
+
 ## Limitations
 
 - No measurement-uncertainty budget; the weights' `U` is reported next to the results for comparison.
