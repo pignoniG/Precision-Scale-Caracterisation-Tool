@@ -44,6 +44,20 @@ certificate and its expanded uncertainty `U`. Loads are written as names joined 
 because weights of one set are usually calibrated together and so correlated. Tares in the tare-load test
 can be any objects; their mass is never used.
 
+## Plot
+
+The **Plot** button opens a live graph of the weight over time; when the balance sends temperature lines
+(see below) the temperature is drawn on a second axis. Weight can be shown as the change from the first
+reading in view, in mg, which is the usual way to look at warm-up and drift. Choose the time span (last
+5 min ... all), show temperature as °C change or raw count, and point at the graph for the values. The
+window works on any log: **Open log...** loads a `raw.csv` or a `scale_logger.py` file, or from the shell:
+
+```bash
+python3 scale_plot.py sessions/20261017_214545/raw.csv
+```
+
+It uses only tkinter, so there is nothing extra to install.
+
 ## Output
 
 Each session gets its own folder under `sessions/`:
