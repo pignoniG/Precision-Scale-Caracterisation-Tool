@@ -303,7 +303,7 @@ def gui(args):
     root = tk.Tk(); root.title('Balance characterisation')
     q = queue.Queue(); live = Live()
     st = dict(source=None, raw=None, rawf=None, plan=None, idx=0, test=None, steps=[], results=[],
-              folder=None, weights={}, recorded_t=0, temp=None, temp0=None, ref=None)
+              folder=None, weights={}, recorded_t=0, temp=None, temp0=None, ref=None, wt=[], wv=[], tt=[], tc=[])
 
     # ---------------- session folder and files
     def ensure_session():
@@ -335,6 +335,7 @@ def gui(args):
     ttk.Checkbutton(top, text='simulate', variable=sim).pack(side='left')
     def connect():
         disconnect(); st['temp'] = st['temp0'] = None; show_temp(False)
+        for k_ in ('wt', 'wv', 'tt', 'tc'): st[k_].clear()
         try:
             src = SimSource(q) if sim.get() else SerialSource(port.get(), int(baud.get()), par.get(), q)
         except Exception as e:
@@ -343,6 +344,12 @@ def gui(args):
     def disconnect():
         if st['source']: st['source'].stop(); st['source'] = None
     conn_btn = ttk.Button(top, text='Connect', command=connect); conn_btn.pack(side='left', padx=6)
+    def open_plot():
+        import scale_plot
+        try: k = float(cpc.get().replace(',', '.'))
+        except (NameError, ValueError): k = COUNTS_PER_C
+        scale_plot.run_plot(root, lambda: (st['wt'], st['wv'], st['tt'], st['tc']), 'Weight and temperature', k)
+    ttk.Button(top, text='Plot', command=open_plot).pack(side='left')
     reading = ttk.Label(top, text='---', font=('Menlo', 26)); reading.pack(side='right')
     stab_lbl = ttk.Label(top, text='', width=22); stab_lbl.pack(side='right', padx=8)
     temp_lbl = ttk.Label(top, text='', width=30, font=('Menlo', 12))      # shown once a T line arrives
@@ -655,7 +662,7 @@ def gui(args):
                 _, t, txt = ev
                 tm = TLINE.match(txt)
                 if tm:
-                    st['temp'] = (t, int(tm.group(1)))
+                    st['temp'] = (t, int(tm.group(1))); st['tt'].append(t); st['tc'].append(st['temp'][1])
                     if st['temp0'] is None:
                         st['temp0'] = st['temp'][1]; show_temp(True)
                     if st['raw']:
@@ -663,6 +670,8 @@ def gui(args):
                                             'T', st['temp'][1], '', txt])
                     continue
                 res = live.feed(t, txt)
+                if res and len(st['wt']) < 600000:
+                    st['wt'].append(t); st['wv'].append(res[2])
                 if res and res[1] != 'S' and t > st['recorded_t']:
                     st['moved'] = True
                 if st['raw']:
