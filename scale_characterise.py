@@ -93,7 +93,7 @@ class SimSource(threading.Thread):
         if data.strip() == b'':
             self.out.put(('line', now, 'ES'))
         elif data.strip() == b'XV':
-            self.out.put(('line', now, 'XV SVC 10.50 ID 874543'))
+            self.out.put(('line', now, 'XV SVC 10.50 ID 123456'))
         elif data.strip() == b'T':
             self.tare = self.target                # tare once stable: the reading goes to zero
         return True
@@ -400,7 +400,7 @@ def gui(args):
     # ---------------- top: connection and live reading
     top = ttk.Frame(root, padding=6); top.pack(fill='x')
     ttk.Label(top, text='Port').pack(side='left')
-    port = ttk.Combobox(top, width=30); port.pack(side='left', padx=4)
+    port = ttk.Combobox(top, width=24); port.pack(side='left', padx=4)
     try:
         import serial.tools.list_ports as lp
         port['values'] = [p.device for p in lp.comports()]
@@ -482,7 +482,7 @@ def gui(args):
     link_lbl = ttk.Label(root, text='', padding=(8, 0)); link_lbl.pack(anchor='w', after=top)     # what the balance answered
     reading = ttk.Label(top, text='---', font=('Menlo', 26)); reading.pack(side='right')
     stab_lbl = ttk.Label(top, text='', width=22); stab_lbl.pack(side='right', padx=8)
-    temp_lbl = ttk.Label(top, text='', width=30, font=('Menlo', 12))      # shown once a T line arrives
+    temp_lbl = ttk.Label(top, text='', width=26, font=('Menlo', 11))      # shown once a T line arrives
     banner = tk.Label(root, text='', fg='white', bg='#b03a2e', font=('Helvetica', 14, 'bold'), pady=4)   # no data from the balance
 
     body = ttk.Frame(root, padding=6); body.pack(fill='both', expand=True)
@@ -948,7 +948,7 @@ def gui(args):
             root.destroy()
         root.after(300, stall_go); root.after(int(args.demo_stall * 1000), stall); root.after(int(args.demo_stall * 1000) + 6000, stall_check)
     if args.shot:                          # README screenshot: capture the window mid-run, then quit
-        root.geometry('1250x800+0+40')
+        root.geometry('1480x930+0+30'); root.lift(); root.attributes('-topmost', True)
         def shot():
             import subprocess
             root.update_idletasks()
