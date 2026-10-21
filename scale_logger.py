@@ -7,7 +7,8 @@ configuration file, sector I-FACE: S = cONT, b = 9600, P = -e-, Pause = 0 (or 1)
 cable: Data I/O pin 12 (RS out) -> PC RxD, pin 13 (RS COM) -> PC GND, true RS-232 adapter.
 
 Each line from the balance looks like "S    294.378 g" (stable) or "SD   294.379 g" (moving).
-The CSV gets: ISO time, seconds since start, status (S/SD/other), value, unit, raw line.
+The CSV gets: ISO time, seconds since start, status (S/SD/T/R/other), value, unit, raw line.
+T = temperature count and R = raw A/D count of a patched ROM (service cassette), both optional.
 
 Usage:
   scale_logger.py                       # first USB serial port, 9600 7E1, file named by date/time
@@ -23,6 +24,9 @@ except ImportError:
     sys.exit("needs pyserial:  python3 -m pip install pyserial")
 
 LINE = re.compile(r'^\s*(S|SD|SI|SIR)?\s*([-+]?\d+(?:\.\d+)?)\s*(\S+)?\s*$')
+TLINE = re.compile(r'^\s*T\s+(\d+)\s*$')        # temperature count line of a patched Mettler ROM, logged with status T
+# raw A/D line of the service cassette: the raw value is logged with status R (see scale_plot.py)
+RLINE = re.compile(r'^R ([0-9A-F]{8}) ([0-9A-F]{6})(?: ([0-9A-F]{6}) ([0-9A-F]{6}) ([0-9A-F]{2}))?(?: G.*)?$')
 
 
 def find_port():
@@ -65,13 +69,20 @@ def main():
                     continue
                 txt = raw.decode('ascii', 'replace').strip()
                 m = LINE.match(txt)
+                rm = RLINE.match(txt)
                 now = time.time()
-                if m:
+                tm = TLINE.match(txt)
+                if tm:
+                    status, value, unit = 'T', int(tm.group(1)), 'cnt'
+                elif rm:
+                    raw = int(rm.group(2), 16); raw -= (1 << 24) if raw & 0x800000 else 0
+                    status, value, unit = 'R', raw, 'cnt'
+                elif m:
                     status, value, unit = m.group(1) or '', float(m.group(2)), m.group(3) or ''
                 else:
                     status, value, unit = 'other', '', ''
                     bad += 1
-                if a.stable_only and status != 'S':
+                if a.stable_only and status not in ('S', 'R'):
                     continue
                 w.writerow([datetime.datetime.now().isoformat(timespec='milliseconds'),
                             f'{now - t0:.3f}', status, value, unit, txt])
