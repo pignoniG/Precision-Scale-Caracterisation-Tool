@@ -1,5 +1,5 @@
 """Tests of the parts of scale_characterise.py that work without a window or a balance."""
-import os, random, statistics, sys, unittest
+import os, random, statistics, sys, time, unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import scale_characterise as sc
 
@@ -31,6 +31,37 @@ class LineTests(unittest.TestCase):
         self.assertTrue(sc.RLINE.match('R 01458580 0CB736 051C98 051C98 18 G0280C400 450C55 1AD0'))   # debug build
         self.assertEqual(sc.XVLINE.match('XV SVC 10.50 ID 874543').groups(), ('10.50', '874543'))
         self.assertFalse(sc.RLINE.match('ES')); self.assertFalse(sc.XVLINE.match('XV'))
+
+
+class FakePort:
+    """stands in for serial.Serial: no data, and reading a closed port fails like the real one"""
+    def __init__(self, *a, **k): self.closed = False
+    def reset_input_buffer(self): pass
+    def readline(self):
+        if self.closed: raise OSError(9, 'Bad file descriptor')
+        time.sleep(0.05); return b''
+    def write(self, data): pass
+    def close(self): self.closed = True
+
+
+class SourceTests(unittest.TestCase):
+    def source(self):
+        import serial, queue
+        self._orig = serial.Serial; serial.Serial = FakePort
+        self.addCleanup(lambda: setattr(serial, 'Serial', self._orig))
+        q = queue.Queue(); s = sc.SerialSource('fake', 9600, 'E', q); s.start(); time.sleep(0.2)
+        return s, q
+
+    def test_closing_the_port_on_purpose_is_not_an_error(self):
+        s, q = self.source()
+        s.stop(); time.sleep(0.3)                           # Reconnect / Disconnect stop the old source
+        self.assertTrue(q.empty())
+
+    def test_a_port_lost_under_a_running_source_is_reported(self):
+        s, q = self.source()
+        s.ser.close(); time.sleep(0.3)                      # the adapter went away
+        ev = q.get_nowait()
+        self.assertEqual(ev[0], 'error'); self.assertIs(ev[2], s)    # tagged with its source, so an old one can be ignored
 
 
 class RawViewTests(unittest.TestCase):

@@ -52,7 +52,9 @@ class SerialSource(threading.Thread):
             try:
                 raw = self.ser.readline()
             except Exception as e:
-                self.out.put(('error', str(e))); break
+                if self.running:                  # a port closed on purpose (Reconnect, Disconnect) is not an error
+                    self.out.put(('error', str(e), self))
+                break
             if raw:
                 self.out.put(('line', time.time(), raw.decode('ascii', 'replace').strip()))
 
@@ -844,6 +846,8 @@ def gui(args):
             while True:
                 ev = q.get_nowait()
                 if ev[0] == 'error':
+                    if len(ev) > 2 and ev[2] is not st['source']:
+                        continue                         # an old connection that was replaced meanwhile
                     st['lost'] = True; say('serial error: ' + ev[1] + ' - trying to reconnect'); update_tare(); start_reconnect(); continue
                 _, t, txt = ev
                 st['last_t'] = t
