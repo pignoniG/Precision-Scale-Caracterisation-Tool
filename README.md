@@ -22,9 +22,15 @@ balance, not an accredited calibration: it reports the measured quantities, not 
 | **ABBA comparison** | reference A and test mass B in A-B-B-A cycles | mean difference B - A with its standard deviation and the standard uncertainty of the mean; with a calibrated A, the mass of B |
 | **Free log** | nothing step by step; for warm-up, drift and creep runs | the raw stream, plus time-stamped remarks |
 
-**Zeroing.** The cable is receive-only, so the program never sends commands to the balance. Instead it
-reads the empty pan (or the tare) before every load and works with the difference. That also removes slow
-drift between steps, so you don't need to press tare between placements.
+**Zeroing.** The program reads the empty pan (or the tare) before every load and works with the difference.
+That removes slow drift between steps, so you don't need to press tare between placements. With a
+two-way cable (see the service cassette below) a **Tare balance** button and an optional automatic tare at
+the empty-pan steps are available; the automatic tare is off by default because it hides slow zero drift,
+and it is never used at the tare steps of the tare-load test.
+
+**Stale data.** If the balance stops sending (asleep, cable pulled, adapter dropped), a red banner says so, the
+reading goes grey and nothing is recorded until lines arrive again; a lost serial port is reopened by itself.
+A pause in the stream also breaks the stable stretch, so a frozen value can never be recorded as stable.
 
 **Recording.** A step is recorded when the balance has reported stable (`S`) readings, all within ± a few
 display steps of each other, for a set time (default 12 s, suited to a balance with long averaging). The
@@ -44,13 +50,20 @@ certificate and its expanded uncertainty `U`. Loads are written as names joined 
 because weights of one set are usually calibrated together and so correlated. Tares in the tare-load test
 can be any objects; their mass is never used.
 
+**While a test runs.** The run panel shows the instruction in large type, the expected reading, a bar for the
+time the reading has been stable and a coloured state ("moving", "stable 7.2 of 12 s", "waiting for the right
+load"). Space records now, backspace undoes the last step. Start and Finish ask before they discard or end
+a running test. The list of test weights is saved in `~/.scale_characterise/weights.json` and comes back at
+the next start (**Defaults** restores the examples).
+
 ## Plot
 
 The **Plot** button opens a live graph of the weight over time; when the balance sends temperature lines
 (see below) the temperature is drawn on a second axis. Weight can be shown as the change from the first
 reading in view, in mg, which is the usual way to look at warm-up and drift. Choose the time span (last
 5 min ... all), show temperature as °C change or raw count, and point at the graph for the values. The
-window works on any log: **Open log...** loads a `raw.csv` or a `scale_logger.py` file, or from the shell:
+window can also show the raw A/D value of the service cassette (**from raw A/D**, in counts or, once counts per
+gram are known, in mg), which resolves drift far below the 1 mg display. It works on any log: **Open log...** loads a `raw.csv` or a `scale_logger.py` file, or from the shell:
 
 ```bash
 python3 scale_plot.py sessions/20261017_214545/raw.csv
@@ -76,6 +89,7 @@ Requirements: Python 3 with tkinter (included in the python.org installers) and 
 python3 scale_characterise.py              # the GUI
 python3 scale_characterise.py --simulate   # try it without a balance
 python3 scale_logger.py -o warmup.csv --minutes 180   # plain logger, no GUI
+python3 -m unittest discover -s tests               # tests of the parts that need neither window nor balance
 ```
 
 ### Mettler-Toledo AM/PM balances
@@ -104,6 +118,25 @@ regular but unreadable characters, and the RS-232 voltage can damage it.
 | AU (suppress special characters) | `on` |
 
 The PC side is then 9600 baud, 7 data bits, even parity, 1 stop bit, no flow control.
+
+### Service cassette (optional)
+
+With the [service cassette](https://github.com/pignoniG/Mettler_PM_UnofficialServiceCassette) ROM and a two-way
+cable (the balance's RS in pin 2 to the PC's TxD) the tool uses more of the balance. On connect it asks the
+balance who it is: a newline and `XV`. A service cassette answers `XV SVC <version> ID <number>`, which fills
+*serial / ID* and goes into the report; a standard cassette answers `ES`, which is enough to enable the tare
+(the stock `T` command); no answer means a receive-only cable and the tool stays passive. `--no-probe` sends
+nothing at all. The service cassette also sends an `R` line with the raw A/D value:
+
+- every step records the mean raw value (`raw_mean`, `raw_std`, `raw_n` in `steps.csv`) and `raw.csv` gets the
+  values with status `R`;
+- each test report gets an **A/D counts view**: the same evaluation on the raw counts, converted to grams
+  with the counts per gram fitted on that run (1 count is about 0.65 µg on a PM4600), so repeatability,
+  eccentricity and linearity are resolved far below the display step; the gain error is removed by that fit,
+  so the error-of-indication column of that view is relative to the fitted gain;
+- the temperature is taken from the `R` line when no `T` lines arrive.
+
+The program and the EEPROM tool cannot hold the serial port at the same time.
 
 ### Temperature (optional)
 

@@ -27,6 +27,11 @@ import argparse, csv, datetime, json, math, os, queue, random, re, statistics, s
 LINE = re.compile(r'^\s*(S|SD|SI|SIR)?\s*([-+]?\d+(?:\.\d+)?)\s*(\S+)?\s*$')
 # optional temperature line from a patched Mettler ROM: 'T 297904' = the balance's raw temperature count
 TLINE = re.compile(r'^\s*T\s+(\d+)\s*$')
+# lines of the service cassette (patched ROM): R = raw A/D value (short: window sum + raw; the long form, about once a second,
+# adds the unfiltered and filtered temperature counts and the window length), XV = its answer to the identify command
+RLINE = re.compile(r'^R ([0-9A-F]{8}) ([0-9A-F]{6})(?: ([0-9A-F]{6}) ([0-9A-F]{6}) ([0-9A-F]{2}))?(?: G.*)?$')
+XVLINE = re.compile(r'^XV SVC (\S+) ID ([0-9A-F]+)$')
+STALE_S = 3.0                # seconds without any line before the stream counts as lost
 COUNTS_PER_C = 2000          # Mettler service manual 4.2.7: count difference / 2000 = temperature difference in C
 ECC_POSITIONS = ['1 centre', '2 front left', '3 rear left', '4 rear right', '5 front right']
 
@@ -36,6 +41,7 @@ class SerialSource(threading.Thread):
     def __init__(self, port, baud=9600, parity='E', out=None):
         super().__init__(daemon=True)
         import serial
+        self.params = (port, baud, parity)
         self.ser = serial.Serial(port, baud, bytesize=7 if parity != 'N' else 8,
                                  parity=parity, stopbits=1, timeout=0.5)
         self.ser.reset_input_buffer(); self.ser.readline()
@@ -50,6 +56,13 @@ class SerialSource(threading.Thread):
             if raw:
                 self.out.put(('line', time.time(), raw.decode('ascii', 'replace').strip()))
 
+    def write(self, data):
+        """send bytes to the balance (needs the balance's receive wire); False if the port is gone"""
+        try:
+            self.ser.write(data); return True
+        except Exception:
+            return False
+
     def stop(self):
         self.running = False
         try: self.ser.close()
@@ -57,12 +70,14 @@ class SerialSource(threading.Thread):
 
 
 class SimSource(threading.Thread):
-    """Fake balance: the GUI sets .load_g; output settles like the comparator ROM with noise."""
-    def __init__(self, out=None, d=0.001):
+    """Fake balance: the GUI sets .load_g; output settles like the comparator ROM with noise.  It also sends R lines like
+    the service cassette and answers newline / XV / T (service=False: a receive-only cable, no answers)."""
+    def __init__(self, out=None, d=0.001, service=True, tlines=True):
         super().__init__(daemon=True)
         self.out = out or queue.Queue(); self.running = True; self.d = d
         self._load = 0.0; self.shown = 0.0; self.drift = 0.0; self.t_change = 0
-        self.temp = 297904; self.t_temp = 0
+        self.temp = 297904; self.t_temp = 0; self.service = service; self.tlines = tlines
+        self.tare = 0.0; self.target = 0.0; self.n = 0
 
     @property
     def load_g(self): return self._load
@@ -71,28 +86,52 @@ class SimSource(threading.Thread):
     def load_g(self, g):                       # any handling counts as a disturbance, even an equal mass
         self._load = g; self.t_change = time.time(); self.shown -= 0.05
 
+    def write(self, data):
+        if not self.service:
+            return True
+        now = time.time()
+        if data.strip() == b'':
+            self.out.put(('line', now, 'ES'))
+        elif data.strip() == b'XV':
+            self.out.put(('line', now, 'XV SVC 10.50 ID 874543'))
+        elif data.strip() == b'T':
+            self.tare = self.target                # tare once stable: the reading goes to zero
+        return True
+
     def run(self):
         while self.running:
             time.sleep(0.05)                       # 20 lines/s so demos run quickly
+            self.n += 1
             self.drift += random.gauss(0, 0.00003)
-            target = self.load_g * (1 + 2e-6) + 0.000004 * self.load_g ** 2 / 4000 + self.drift
-            self.shown += (target - self.shown) * 0.35
+            self.target = self.load_g * (1 + 2e-6) + 0.000004 * self.load_g ** 2 / 4000 + self.drift
+            self.shown += (self.target - self.tare - self.shown) * 0.35
             v = round(self.shown + random.gauss(0, 0.0004), 3)
             st = 'S' if time.time() - self.t_change > 0.8 else 'SD'
-            self.out.put(('line', time.time(), f'{st:4s}{v:10.3f} g'))
-            if time.time() - self.t_temp > 2:
-                self.t_temp = time.time(); self.temp += random.randint(-3, 6)
-                self.out.put(('line', self.t_temp, f'T {self.temp}'))
+            now = time.time()
+            self.out.put(('line', now, f'{st:4s}{v:10.3f} g'))
+            raw = 1500000 + round((self.shown + self.tare) * 1548 + random.gauss(0, 0.5))
+            if self.n % 8 == 0:
+                self.out.put(('line', now, f'R 00A17DC0 {raw & 0xFFFFFF:06X} {self.temp:06X} {self.temp:06X} 14'))
+            else:
+                self.out.put(('line', now, f'R 00A17DC0 {raw & 0xFFFFFF:06X}'))
+            if now - self.t_temp > 2:
+                self.t_temp = now; self.temp += random.randint(-3, 6)
+                if self.tlines: self.out.put(('line', now, f'T {self.temp}'))
 
     def stop(self): self.running = False
 
 
 # ============================================================== stability / recording
 class Live:
-    """Latest readings and a stability test: only 'S' lines for settle_s seconds, spread <= tol."""
+    """Latest readings and a stability test: only 'S' lines for settle_s seconds, spread <= tol, no gap in the stream
+    (a pause in the lines breaks the stable stretch)."""
+    GAP = 1.5
+
     def __init__(self):
         self.hist = []            # (t, status, value)
+        self.rhist = []           # (t, raw A/D count) from the service cassette's R lines
         self.last = None
+        self._tlo = None          # start of the stretch the last value() averaged over
 
     def feed(self, t, txt):
         m = LINE.match(txt)
@@ -104,27 +143,45 @@ class Live:
         while self.hist and self.hist[0][0] < cut: self.hist.pop(0)
         return self.last
 
-    def stable_for(self, tol):
-        """seconds of uninterrupted S readings within +-tol of the latest one"""
+    def feed_raw(self, t, raw):
+        self.rhist.append((t, raw)); cut = t - 120
+        while self.rhist and self.rhist[0][0] < cut: self.rhist.pop(0)
+
+    def _stretch(self, tol, avg_s=None):
+        """samples of the current stable stretch, newest first: S readings within +-tol of the latest, without a gap"""
+        t_end, _, v = self.hist[-1]; out, prev = [], t_end
+        for t, st, x in reversed(self.hist):
+            if st != 'S' or abs(x - v) > tol or prev - t > self.GAP: break
+            if avg_s is not None and t < t_end - avg_s: break
+            out.append((t, x)); prev = t
+        return out
+
+    def stable_for(self, tol, now=None):
+        """seconds of uninterrupted S readings within +-tol of the latest one (0 when the stream has stopped)"""
         if not self.hist or self.hist[-1][1] != 'S':
             return 0.0
-        t_end, _, v = self.hist[-1]; t0 = t_end
-        for t, st, x in reversed(self.hist):
-            if st != 'S' or abs(x - v) > tol: break
-            t0 = t
-        return t_end - t0
+        if now is not None and now - self.hist[-1][0] > self.GAP:
+            return 0.0
+        xs = self._stretch(tol)
+        return xs[0][0] - xs[-1][0] if xs else 0.0
 
     def value(self, avg_s, tol):
         """mean of the current stable stretch (S readings within +-tol of the latest), at most the
         last avg_s seconds of it; the latest value if the balance is not stable"""
         if not self.hist: return None
         t_end, st_end, v = self.hist[-1]
-        if st_end != 'S': return v
-        xs = []
-        for t, st, x in reversed(self.hist):
-            if st != 'S' or abs(x - v) > tol or t < t_end - avg_s: break
-            xs.append(x)
-        return statistics.mean(xs)
+        if st_end != 'S':
+            self._tlo = None; return v
+        xs = self._stretch(tol, avg_s)
+        self._tlo = xs[-1][0]
+        return statistics.mean(x for _, x in xs)
+
+    def raw_stats(self, t_lo, t_hi=None):
+        """(mean, std, n) of the raw counts since t_lo (the window value() averaged), or None without R lines"""
+        if t_lo is None: return None
+        xs = [r for t, r in self.rhist if t >= t_lo and (t_hi is None or t <= t_hi)]
+        if len(xs) < 2: return None
+        return statistics.mean(xs), statistics.stdev(xs), len(xs)
 
 
 # ============================================================== weights
@@ -295,6 +352,27 @@ def evaluate(test, steps, weights, d):
     return r
 
 
+def raw_view(test, steps, weights, d):
+    """The same evaluation on the raw A/D counts of the service cassette.  The counts are converted to grams with the
+    counts per gram of this run (regression of the displayed nets on the raw nets, through zero), so the display's
+    rounding to d does not enter and differences show at the microgram level; the gain error is removed by that fit.
+    -> (lines, counts per gram) or None when a recorded step has no raw value."""
+    done = [s for s in steps if 'value' in s]
+    if not done or any(s.get('raw') is None for s in done):
+        return None
+    zr = zg = None; pairs = []
+    for s in done:
+        if s['kind'] in ('zero', 'tare'): zr, zg = s['raw'], s['value']
+        elif s['kind'] == 'load': pairs.append((s['raw'] - (zr if zr is not None else 0.0), s['value'] - (zg if zg is not None else 0.0)))
+    num, den = sum(a * b for a, b in pairs), sum(a * a for a, b in pairs)
+    if den <= 0 or num <= 0:
+        return None
+    gpc = num / den
+    r2 = evaluate(test, [dict(s, value=s['raw'] * gpc) for s in done], weights, d)
+    head = f'A/D counts view: {1 / gpc:.1f} counts per g fitted on this run, 1 count = {gpc * 1e6:.2f} ug; gain error removed by the fit'
+    return [head] + r2['lines'], 1 / gpc
+
+
 # ============================================================== GUI
 def gui(args):
     import tkinter as tk
@@ -303,7 +381,8 @@ def gui(args):
     root = tk.Tk(); root.title('Balance characterisation')
     q = queue.Queue(); live = Live()
     st = dict(source=None, raw=None, rawf=None, plan=None, idx=0, test=None, steps=[], results=[],
-              folder=None, weights={}, recorded_t=0, temp=None, temp0=None, ref=None, wt=[], wv=[], tt=[], tc=[])
+              folder=None, weights={}, recorded_t=0, temp=None, temp0=None, ref=None, wt=[], wv=[], tt=[], tc=[],
+              rt=[], rc=[], last_t=None, svc=None, twoway=False, lost=False, probe_t=0, tline_t=0, cpg=None)
 
     # ---------------- session folder and files
     def ensure_session():
@@ -315,7 +394,7 @@ def gui(args):
         st['raw'] = csv.writer(st['rawf']); st['raw'].writerow(['time', 'status', 'value', 'unit', 'line'])
         stepf = open(os.path.join(st['folder'], 'steps.csv'), 'w', newline='')
         st['stepf'] = stepf; st['stepw'] = csv.writer(stepf)
-        st['stepw'].writerow(['time', 'test', 'step', 'kind', 'label', 'load', 'value_g', 'stable_s', 'temp_count', 'temp'])
+        st['stepw'].writerow(['time', 'test', 'step', 'kind', 'label', 'load', 'value_g', 'stable_s', 'temp_count', 'temp', 'raw_mean', 'raw_std', 'raw_n'])
         folder_lbl.config(text=st['folder'])
 
     # ---------------- top: connection and live reading
@@ -335,12 +414,61 @@ def gui(args):
     ttk.Checkbutton(top, text='simulate', variable=sim).pack(side='left')
     def connect():
         disconnect(); st['temp'] = st['temp0'] = None; show_temp(False)
-        for k_ in ('wt', 'wv', 'tt', 'tc'): st[k_].clear()
+        for k_ in ('wt', 'wv', 'tt', 'tc', 'rt', 'rc'): st[k_].clear()
         try:
-            src = SimSource(q) if sim.get() else SerialSource(port.get(), int(baud.get()), par.get(), q)
+            src = (SimSource(q, service=not args.sim_plain, tlines=not args.sim_no_t) if sim.get()
+                   else SerialSource(port.get(), int(baud.get()), par.get(), q))
         except Exception as e:
             messagebox.showerror('Serial port', str(e)); return
         ensure_session(); st['source'] = src; src.start(); conn_btn.config(text='Reconnect')
+        st.update(last_t=time.time(), svc=None, twoway=False, lost=False, tline_t=0)
+        link_lbl.config(text='')
+        if not args.no_probe: root.after(1200, lambda: probe(src))
+
+    def probe(src):
+        """ask the balance who it is: a newline (the receiver drops the first byte), then the service cassette's XV.
+        A service cassette answers 'XV SVC ...', a standard cassette 'ES', a receive-only cable nothing."""
+        if st['source'] is not src: return
+        link_lbl.config(text='asking the balance...'); st['probe_t'] = time.time()
+        src.write(b'\n')
+        root.after(600, lambda: src.write(b'XV\r\n'))
+        root.after(3000, lambda: probe_done(src))
+
+    def probe_done(src):
+        if st['source'] is not src: return
+        st['probe_t'] = 0
+        if st['svc']:
+            link_lbl.config(text=f'service cassette {st["svc"][0]}, ID {st["svc"][1]}: commands available')
+        elif st['twoway']:
+            link_lbl.config(text='balance answers commands (standard cassette): tare available')
+        else:
+            link_lbl.config(text='receive-only cable: the balance cannot be tared from here')
+        update_tare()
+
+    def update_tare():
+        tare_btn.state(['!disabled' if (st['twoway'] and st['source'] and not st['lost']) else 'disabled'])
+
+    def tare_now():
+        src = st['source']
+        if src and st['twoway'] and src.write(b'T\r\n'):
+            say('  tare sent (the balance tares when the reading is stable)')
+
+    def start_reconnect():
+        src = st['source']
+        if not isinstance(src, SerialSource) or st.get('reconnecting'): return
+        st['reconnecting'] = True
+        def attempt():
+            if st['source'] is not src or not st['lost']:
+                st['reconnecting'] = False; return
+            try:
+                new = SerialSource(*src.params, q)
+            except Exception:
+                root.after(2000, attempt); return
+            src.stop(); st['source'] = new; new.start()
+            st.update(lost=False, reconnecting=False, last_t=time.time())
+            say('  serial port back'); update_tare()
+            if not args.no_probe: root.after(1200, lambda: probe(new))
+        root.after(2000, attempt)
     def disconnect():
         if st['source']: st['source'].stop(); st['source'] = None
     conn_btn = ttk.Button(top, text='Connect', command=connect); conn_btn.pack(side='left', padx=6)
@@ -348,11 +476,14 @@ def gui(args):
         import scale_plot
         try: k = float(cpc.get().replace(',', '.'))
         except (NameError, ValueError): k = COUNTS_PER_C
-        scale_plot.run_plot(root, lambda: (st['wt'], st['wv'], st['tt'], st['tc']), 'Weight and temperature', k)
+        scale_plot.run_plot(root, lambda: (st['wt'], st['wv'], st['tt'], st['tc'], st['rt'], st['rc']), 'Weight and temperature', k,
+                            cpg_fn=lambda: st['cpg'])
     ttk.Button(top, text='Plot', command=open_plot).pack(side='left')
+    link_lbl = ttk.Label(root, text='', padding=(8, 0)); link_lbl.pack(anchor='w', after=top)     # what the balance answered
     reading = ttk.Label(top, text='---', font=('Menlo', 26)); reading.pack(side='right')
     stab_lbl = ttk.Label(top, text='', width=22); stab_lbl.pack(side='right', padx=8)
     temp_lbl = ttk.Label(top, text='', width=30, font=('Menlo', 12))      # shown once a T line arrives
+    banner = tk.Label(root, text='', fg='white', bg='#b03a2e', font=('Helvetica', 14, 'bold'), pady=4)   # no data from the balance
 
     body = ttk.Frame(root, padding=6); body.pack(fill='both', expand=True)
     left = ttk.Frame(body); left.pack(side='left', fill='y')
@@ -400,10 +531,21 @@ def gui(args):
     for c, w, t in (('#0', 70, 'name'), ('nominal', 60, 'nominal g'), ('conv', 95, 'conv. g'), ('U', 50, 'U mg'), ('cls', 35, 'class')):
         tree.heading(c, text=t); tree.column(c, width=w)
     tree.pack()
-    def refresh_weights():
+    cfg_dir = args.config_dir or os.path.join(os.path.expanduser('~'), '.scale_characterise')
+    weights_file = os.path.join(cfg_dir, 'weights.json')
+    DEFAULT_WEIGHTS = {n: dict(nominal=nom, conv=conv, U_mg=U, cls='E2')
+                       for n, nom, conv, U in (('1kg', 1000, 1000, 1.6), ('2kgA', 2000, 2000, 3.0), ('2kgB', 2000, 2000, 3.0))}
+    def save_weights():
+        try:
+            os.makedirs(cfg_dir, exist_ok=True)
+            with open(weights_file, 'w') as f_: json.dump(st['weights'], f_, indent=1)
+        except OSError:
+            pass
+    def refresh_weights(save=True):
         tree.delete(*tree.get_children())
         for n, w in st['weights'].items():
             tree.insert('', 'end', text=n, values=(w['nominal'], f'{w["conv"]:.6f}', w['U_mg'], w['cls']))
+        if save: save_weights()
     def edit_weight(name=None):
         w = st['weights'].get(name, dict(nominal=0, conv=0, U_mg=0, cls='E2'))
         dlg = tk.Toplevel(root); dlg.title('Weight'); ents = {}
@@ -428,18 +570,26 @@ def gui(args):
     ttk.Button(wb, text='Remove', command=lambda: [st['weights'].pop(tree.item(i)['text'], None) for i in tree.selection()] and refresh_weights()).pack(side='left')
     ttk.Label(wf, text='loads are written as names joined by +,\ne.g. "2kgA + 2kgB", or a number in g',
               foreground='gray').pack(anchor='w')
-    for n, nom, conv, U in (('1kg', 1000, 1000, 1.6), ('2kgA', 2000, 2000, 3.0), ('2kgB', 2000, 2000, 3.0)):
-        st['weights'][n] = dict(nominal=nom, conv=conv, U_mg=U, cls='E2')
-    refresh_weights()
+    try:
+        with open(weights_file) as f_: st['weights'] = json.load(f_)          # the set used last time
+    except (OSError, ValueError):
+        st['weights'] = {k: dict(v) for k, v in DEFAULT_WEIGHTS.items()}
+    def reset_weights():
+        if messagebox.askyesno('Test weights', 'Replace the list with the built-in example weights?'):
+            st['weights'] = {k: dict(v) for k, v in DEFAULT_WEIGHTS.items()}; refresh_weights()
+    ttk.Button(wb, text='Defaults', command=reset_weights).pack(side='left')
+    refresh_weights(save=False)
 
     # ---------------- recording settings
     rs = ttk.LabelFrame(left, text='Recording', padding=6); rs.pack(fill='x')
     settle = tk.DoubleVar(value=12.0); tol = tk.DoubleVar(value=2.0); avg = tk.DoubleVar(value=3.0)
     auto = tk.BooleanVar(value=True); plaus = tk.DoubleVar(value=1.0)
-    for i, (t, v) in enumerate((('stable for [s]', settle), ('within [d]', tol), ('average last [s]', avg),
+    for i, (t, v) in enumerate((('stable for [s]', settle), ('within ± [d]', tol), ('average last [s]', avg),
                                 ('expected within ± [% of load]', plaus))):
         ttk.Label(rs, text=t).grid(row=i, column=0, sticky='w'); ttk.Entry(rs, textvariable=v, width=8).grid(row=i, column=1)
     ttk.Checkbutton(rs, text='record automatically when stable\nand close to the expected value', variable=auto).grid(row=4, column=0, columnspan=2, sticky='w')
+    autotare = tk.BooleanVar(value=False)
+    ttk.Checkbutton(rs, text='tare at empty-pan steps (balance must\nanswer commands; hides slow zero drift)', variable=autotare).grid(row=5, column=0, columnspan=2, sticky='w')
 
     # ---------------- tests
     nb = ttk.Notebook(right); nb.pack(fill='x')
@@ -475,9 +625,12 @@ def gui(args):
 
     # ---------------- run panel
     run = ttk.LabelFrame(right, text='Run', padding=6); run.pack(fill='x', pady=6)
-    instr = ttk.Label(run, text='Connect, choose a test and press Start.', font=('Helvetica', 15), wraplength=620)
+    instr = ttk.Label(run, text='Connect, choose a test and press Start.', font=('Helvetica', 22, 'bold'), wraplength=760)
     instr.pack(anchor='w')
     prog = ttk.Label(run, text='', foreground='gray'); prog.pack(anchor='w')
+    stab_row = ttk.Frame(run); stab_row.pack(fill='x', pady=(2, 0))
+    stab_bar = ttk.Progressbar(stab_row, mode='determinate', maximum=12.0, length=260); stab_bar.pack(side='left')
+    state_lbl = ttk.Label(stab_row, text='', font=('Helvetica', 13, 'bold')); state_lbl.pack(side='left', padx=10)
     btns = ttk.Frame(run); btns.pack(fill='x', pady=4)
 
     out = tk.Text(right, height=18, font=('Menlo', 11)); out.pack(fill='both', expand=True)
@@ -487,6 +640,10 @@ def gui(args):
     def start():
         if not st['source']:
             messagebox.showwarning('Not connected', 'Connect to the balance (or tick simulate) first.'); return
+        if st['plan'] is not None and st['idx'] < len(st['plan']) and not messagebox.askyesno(
+                'Test running', f'The {st["test"]} test is still running (step {st["idx"] + 1} of {len(st["plan"])}).\n'
+                                'Starting a new test discards its unfinished steps. Continue?'):
+            return
         name = list(tests)[nb.index(nb.select())]
         try:
             if name == 'repeatability':
@@ -535,6 +692,8 @@ def gui(args):
         sim_load = 0.0
         if s['kind'] == 'zero':
             text = f'Empty the pan.  ({s["label"]})'
+            if autotare.get() and st['twoway'] and st['source'] and live.last and abs(live.last[2]) > 0.5 and not st['lost']:
+                tare_now()                       # a stale tare (reading far from zero on an empty pan)
         elif s['kind'] == 'tare':
             text = f'{s["label"]}'
             sim_load = sim_mass(s.get('tare'))
@@ -587,16 +746,25 @@ def gui(args):
             return abs(v) > 0.5 and st.get('moved', False)   # something was moved since the prompt
         return True
 
+    def fresh():
+        return st['last_t'] is not None and time.time() - st['last_t'] <= STALE_S and not st['lost']
+
     def record(manual=False):
         p, i = st['plan'], st['idx']
         if p is None or i >= len(p) or live.last is None: return
+        if not fresh():
+            if manual: messagebox.showwarning('No data', 'The balance is not sending: nothing was recorded.')
+            return
         v = live.value(avg.get(), tol.get() * float(fields['d [g]'].get() or 0.001)); s = p[i]
+        rs = live.raw_stats(live._tlo)
+        s['raw'], s['raw_std'], s['raw_n'] = rs if rs else (None, None, 0)
         s['value'] = v; s['time'] = time.time()
-        s['stable_s'] = live.stable_for(tol.get() * float(fields['d [g]'].get() or 0.001))
+        s['stable_s'] = live.stable_for(tol.get() * float(fields['d [g]'].get() or 0.001), time.time())
         s['temp_count'] = st['temp'][1] if st['temp'] else None
         st['stepw'].writerow([datetime.datetime.now().isoformat(timespec='seconds'), st['test'], i + 1, s['kind'],
                               s['label'], s.get('load', s.get('tare', '')), f'{v:.5f}', f'{s["stable_s"]:.1f}',
-                              st['temp'][1] if st['temp'] else '', temp_c(st['temp'][1]) if st['temp'] else ''])
+                              st['temp'][1] if st['temp'] else '', temp_c(st['temp'][1]) if st['temp'] else '',
+                              f'{rs[0]:.2f}' if rs else '', f'{rs[1]:.2f}' if rs else '', rs[2] if rs else ''])
         st['stepf'].flush()
         e = expected()
         flag = '' if plausible(v) else f'  (!) far from the expected {e[0]:.3f} g'
@@ -613,11 +781,16 @@ def gui(args):
 
     def abort():
         if st['plan']:
+            if not messagebox.askyesno('Finish test', 'Stop here and evaluate the steps recorded so far?'):
+                return
             say('  aborted - evaluating what was recorded'); finish()
 
     def finish():
         d = float(fields['d [g]'].get() or 0.001)
         r = evaluate(st['test'], st['plan'], st['weights'], d)
+        rv = raw_view(st['test'], st['plan'], st['weights'], d)
+        if rv:
+            r['lines'] += [''] + rv[0]; r['counts_per_g'] = rv[1]; st['cpg'] = rv[1]
         r['time'] = time.time(); r['steps'] = [{k: v for k, v in s.items()} for s in st['plan']]
         st['results'].append(r)
         say(f'--- result: {st["test"]}')
@@ -629,6 +802,8 @@ def gui(args):
     def save(silent=False):
         ensure_session()
         meta = {k: e.get() for k, e in fields.items()}
+        if st['svc']: meta['service cassette'] = f'firmware {st["svc"][0]}, EEPROM ID {st["svc"][1]}'
+        if st['cpg']: meta['counts per g (raw A/D, last test)'] = f'{st["cpg"]:.1f}'
         if st['temp0'] is not None:
             meta['temperature count first / last'] = f'{st["temp0"]} / {st["temp"][1]}'
             meta['temperature change'] = temp_c(st['temp'][1]) if not st['ref'] else f'{temp_c(st["temp"][1])} (reference {st["ref"][1]:g} °C at count {st["ref"][0]})'
@@ -647,56 +822,108 @@ def gui(args):
                 for l in r.get('lines', [r.get('text', '')]): f.write('  ' + l + '\n')
         if not silent: messagebox.showinfo('Saved', f'Report saved in\n{st["folder"]}')
 
-    for t, c in (('Start', start), ('Record now', lambda: record(True)), ('Undo step', back),
+    for t, c in (('Start', start), ('Record now (space)', lambda: record(True)), ('Undo step (backspace)', back),
                  ('Skip', skip), ('Finish / abort', abort), ('Save report', save)):
         ttk.Button(btns, text=t, command=c).pack(side='left', padx=2)
+    tare_btn = ttk.Button(btns, text='Tare balance', command=tare_now, state='disabled'); tare_btn.pack(side='left', padx=(12, 2))
     folder_lbl = ttk.Label(right, text='', foreground='gray'); folder_lbl.pack(anchor='w')
 
     # ---------------- event loop
+    def iso(t): return datetime.datetime.fromtimestamp(t).isoformat(timespec='milliseconds')
+
+    def take_temp(t, count, txt):
+        """a temperature count, from a T line or from the long R line"""
+        st['temp'] = (t, count); st['tt'].append(t); st['tc'].append(count)
+        if st['temp0'] is None:
+            st['temp0'] = count; show_temp(True)
+        if st['raw']:
+            st['raw'].writerow([iso(t), 'T', count, '', txt])
+
     def poll():
         try:
             while True:
                 ev = q.get_nowait()
                 if ev[0] == 'error':
-                    say('serial error: ' + ev[1]); continue
+                    st['lost'] = True; say('serial error: ' + ev[1] + ' - trying to reconnect'); update_tare(); start_reconnect(); continue
                 _, t, txt = ev
+                st['last_t'] = t
                 tm = TLINE.match(txt)
                 if tm:
-                    st['temp'] = (t, int(tm.group(1))); st['tt'].append(t); st['tc'].append(st['temp'][1])
-                    if st['temp0'] is None:
-                        st['temp0'] = st['temp'][1]; show_temp(True)
-                    if st['raw']:
-                        st['raw'].writerow([datetime.datetime.fromtimestamp(t).isoformat(timespec='milliseconds'),
-                                            'T', st['temp'][1], '', txt])
+                    st['tline_t'] = t; take_temp(t, int(tm.group(1)), txt)
                     continue
+                rm = RLINE.match(txt)
+                if rm:                                   # raw A/D value of the service cassette
+                    raw = int(rm.group(2), 16); raw -= (1 << 24) if raw & 0x800000 else 0
+                    live.feed_raw(t, raw)
+                    if len(st['rt']) < 600000: st['rt'].append(t); st['rc'].append(raw)
+                    if st['raw']: st['raw'].writerow([iso(t), 'R', raw, 'cnt', txt])
+                    if rm.group(4) and t - st['tline_t'] > 15:       # no T lines: the filtered count of the long R line
+                        take_temp(t, int(rm.group(4), 16), 'from R line')
+                    continue
+                xm = XVLINE.match(txt)
+                if xm:
+                    st['svc'] = (xm.group(1), xm.group(2)); st['twoway'] = True
+                    if not fields['serial / ID'].get().strip():
+                        fields['serial / ID'].insert(0, 'ID ' + xm.group(2))
+                    if st['source'] and not st['probe_t']: probe_done(st['source'])
+                    update_tare()
+                    if st['raw']: st['raw'].writerow([iso(t), 'other', '', '', txt])
+                    continue
+                if txt == 'ES' and st['probe_t'] and t - st['probe_t'] < 6:
+                    st['twoway'] = True; update_tare()
                 res = live.feed(t, txt)
                 if res and len(st['wt']) < 600000:
                     st['wt'].append(t); st['wv'].append(res[2])
                 if res and res[1] != 'S' and t > st['recorded_t']:
                     st['moved'] = True
                 if st['raw']:
-                    st['raw'].writerow([datetime.datetime.fromtimestamp(t).isoformat(timespec='milliseconds'),
-                                        res[1] if res else 'other', res[2] if res else '', res[3] if res else '', txt])
+                    st['raw'].writerow([iso(t), res[1] if res else 'other', res[2] if res else '', res[3] if res else '', txt])
         except queue.Empty:
             pass
+        now = time.time()
+        stale = bool(st['source']) and (st['lost'] or (st['last_t'] is not None and now - st['last_t'] > STALE_S))
+        if stale:
+            banner.config(text=('SERIAL PORT LOST - reconnecting...' if st['lost'] else
+                                f'NO DATA FROM THE BALANCE for {now - st["last_t"]:.0f} s (asleep, cable, or the balance stopped sending)')
+                               + '  -  nothing is recorded meanwhile')
+            if not banner.winfo_ismapped(): banner.pack(fill='x', after=top)
+        elif banner.winfo_ismapped():
+            banner.pack_forget()
         if st['temp']:
             temp_lbl.config(text=f'T {st["temp"][1]}  {temp_c(st["temp"][1])}')
         if live.last:
             _, s, v, u = live.last
-            reading.config(text=f'{s:2s} {v:10.3f} {u}')
+            reading.config(text=f'{s:2s} {v:10.3f} {u}', foreground='#999999' if stale else '')
             d = float(fields['d [g]'].get() or 0.001)
-            sf = live.stable_for(tol.get() * d)
-            stab_lbl.config(text=f'stable {sf:4.1f} s' if s == 'S' else 'moving')
+            sf = live.stable_for(tol.get() * d, now)
+            stab_lbl.config(text=('no data' if stale else f'stable {sf:4.1f} s') if (stale or s == 'S') else 'moving')
             if st['plan'] is not None and st['idx'] < len(st['plan']):
                 e = expected(); ok = plausible(v)
                 base = f'step {st["idx"]+1} of {len(st["plan"])}  -  {st["test"]}'
-                prog.config(text=base + ('' if e is None else
-                            f'   expected ≈ {e[0]:.3f} g' + ('' if ok else '  - waiting for the right load')))
-                if auto.get() and ok and time.time() - st['recorded_t'] > 2 and sf >= settle.get():
+                prog.config(text=base + ('' if e is None else f'   expected ≈ {e[0]:.3f} g'))
+                stab_bar.config(maximum=max(settle.get(), 0.1), value=min(sf, settle.get()))
+                if stale:
+                    state_lbl.config(text='no data from the balance', foreground='#D64541')
+                elif not ok:
+                    state_lbl.config(text='waiting for the right load' + ('' if e is None else f' (reads {v:.3f}, expected {e[0]:.3f} g)'), foreground='#D64541')
+                elif s != 'S':
+                    state_lbl.config(text='moving: wait for the reading to settle', foreground='#D9822B')
+                elif sf < settle.get():
+                    state_lbl.config(text=f'stable {sf:.1f} of {settle.get():g} s', foreground='#D9822B')
+                else:
+                    state_lbl.config(text='stable: recording' if auto.get() else 'stable: press Record now', foreground='#2E9E4F')
+                if auto.get() and ok and not stale and now - st['recorded_t'] > 2 and sf >= settle.get():
                     record()
+            else:
+                stab_bar.config(value=0); state_lbl.config(text='')
         if st['rawf']: st['rawf'].flush()
         root.after(100, poll)
     poll()
+    def key_ok():
+        w = root.focus_get()
+        return not isinstance(w, (tk.Entry, tk.Text, ttk.Entry, ttk.Combobox, ttk.Button, ttk.Spinbox, tk.Spinbox))
+    root.bind('<space>', lambda e: record(True) if key_ok() else None)
+    root.bind('<BackSpace>', lambda e: back() if key_ok() else None)
     if args.demo:                          # self-test: simulated balance runs one test unattended
         nb.select(list(tests).index(args.demo))
         def demo_go():
@@ -707,6 +934,19 @@ def gui(args):
             else:
                 root.after(500, demo_check)
         root.after(300, demo_go); root.after(2000, demo_check)
+    if args.autoconnect:
+        root.after(300, connect)
+    if args.demo_stall:                    # self-test: the simulated balance stops sending in the middle of a test
+        def stall_go():
+            sim.set(True); settle.set(0.8); rep_n.set('10'); connect(); start()
+        def stall():
+            st['at_stall'] = st['idx']; st['source'].running = False
+        def stall_check():
+            print('STALL banner:', banner.winfo_ismapped(), '|', banner.cget('text')[:70])
+            print('STALL steps recorded before/after:', st['at_stall'], st['idx'], '(must be equal)')
+            print('STALL reading colour:', reading.cget('foreground'))
+            root.destroy()
+        root.after(300, stall_go); root.after(int(args.demo_stall * 1000), stall); root.after(int(args.demo_stall * 1000) + 6000, stall_check)
     if args.shot:                          # README screenshot: capture the window mid-run, then quit
         root.geometry('1250x800+0+40')
         def shot():
@@ -726,6 +966,12 @@ def main():
     ap.add_argument('--dir', help='folder for session sub-folders (default ./sessions)')
     ap.add_argument('--demo', choices=['repeatability', 'eccentricity', 'indication', 'tare_linearity', 'abba'],
                     help=argparse.SUPPRESS)
+    ap.add_argument('--no-probe', action='store_true', help='do not send anything to the balance on connect (no identify query, no tare)')
+    ap.add_argument('--config-dir', help='folder for the saved test weights (default ~/.scale_characterise)')
+    ap.add_argument('--autoconnect', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('--demo-stall', type=float, help=argparse.SUPPRESS)
+    ap.add_argument('--sim-plain', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('--sim-no-t', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--shot', help=argparse.SUPPRESS)
     ap.add_argument('--demo-slow', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--shot-after', type=float, default=10, help=argparse.SUPPRESS)

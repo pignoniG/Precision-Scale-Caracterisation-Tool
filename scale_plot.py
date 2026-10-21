@@ -21,8 +21,9 @@ COUNTS_PER_C = 2000
 
 
 def load_csv(path):
-    """-> (weight_t, weight_g, temp_t, temp_count) with times as epoch seconds."""
-    wt, wv, tt, tc = [], [], [], []
+    """-> (weight_t, weight_g, temp_t, temp_count, raw_t, raw_count) with times as epoch seconds.  Raw counts are the R
+    lines of the service cassette (status R)."""
+    wt, wv, tt, tc, rt, rc = [], [], [], [], [], []
     t0 = None
     with open(path, newline='') as f:
         for r in csv.DictReader(f):
@@ -40,9 +41,11 @@ def load_csv(path):
                     continue
             if st == 'T':
                 tt.append(t); tc.append(v)
+            elif st == 'R':
+                rt.append(t); rc.append(v)
             elif st in ('S', 'SD', 'SI', 'SIR', ''):
                 wt.append(t); wv.append(v)
-    return wt, wv, tt, tc
+    return wt, wv, tt, tc, rt, rc
 
 
 def nice_ticks(lo, hi, n=6):
@@ -63,8 +66,9 @@ def fmt_num(v, step):
     return f'{v:.{d}f}'
 
 
-def run_plot(parent, data_fn, title='Balance plot', counts_per_c=COUNTS_PER_C, own_mainloop=False):
-    """Open a plot window. data_fn() -> (wt, wv, tt, tc), called every second (live) or once (file)."""
+def run_plot(parent, data_fn, title='Balance plot', counts_per_c=COUNTS_PER_C, own_mainloop=False, cpg_fn=None):
+    """Open a plot window. data_fn() -> (wt, wv, tt, tc[, rt, rc]), called every second (live) or once (file);
+    rt, rc are raw A/D counts, cpg_fn() the counts per gram estimated by the last evaluated test."""
     import tkinter as tk
     from tkinter import ttk, filedialog
 
@@ -78,6 +82,10 @@ def run_plot(parent, data_fn, title='Balance plot', counts_per_c=COUNTS_PER_C, o
     spans = {'last 5 min': 300, 'last 30 min': 1800, 'last 2 h': 7200, 'last 6 h': 21600, 'all': None}
     cb = ttk.Combobox(bar, textvariable=span, values=list(spans), width=11, state='readonly'); cb.pack(side='left', padx=4)
     rel = tk.BooleanVar(value=True); ttk.Checkbutton(bar, text='weight as change [mg]', variable=rel).pack(side='left', padx=8)
+    use_raw = tk.BooleanVar(value=False)
+    ttk.Checkbutton(bar, text='from raw A/D', variable=use_raw).pack(side='left')
+    ttk.Label(bar, text='counts/g').pack(side='left', padx=(4, 0))
+    cpg = tk.StringVar(value=''); ttk.Entry(bar, textvariable=cpg, width=7).pack(side='left')
     temp_mode = tk.StringVar(value='°C change')
     ttk.Label(bar, text='temperature').pack(side='left')
     ttk.Combobox(bar, textvariable=temp_mode, values=['°C change', 'count', 'off'], width=9, state='readonly').pack(side='left', padx=4)
@@ -95,7 +103,15 @@ def run_plot(parent, data_fn, title='Balance plot', counts_per_c=COUNTS_PER_C, o
 
     def draw(_=None):
         cv.delete('all')
-        wt, wv, tt, tc = state['fn']()
+        data = state['fn']()
+        wt, wv, tt, tc = data[:4]
+        rt, rc = data[4:6] if len(data) >= 6 else ([], [])
+        if cpg_fn and not cpg.get().strip() and cpg_fn():
+            cpg.set('%.1f' % cpg_fn())                      # counts per gram found by the last test
+        try: kg = float(cpg.get().replace(',', '.')) or None
+        except ValueError: kg = None
+        raw_on = use_raw.get() and len(rt) >= 2
+        if raw_on: wt, wv = rt, (rc if not kg else [c / kg for c in rc])         # grams when counts/g is known, else counts
         W, H = max(cv.winfo_width(), 300), max(cv.winfo_height(), 200)
         pw, ph = W - ML - MR, H - MT - MB
         if len(wt) < 2 and len(tt) < 2:
@@ -119,8 +135,8 @@ def run_plot(parent, data_fn, title='Balance plot', counts_per_c=COUNTS_PER_C, o
             return out
         wpts = bin_series(wpts, pw)
         if wpts:
-            base = sum(v for _, v in wpts[:5]) / len(wpts[:5]) if rel.get() else 0.0
-            sc = 1000.0 if rel.get() else 1.0
+            base = sum(v for _, v in wpts[:5]) / len(wpts[:5]) if (rel.get() or (raw_on and not kg)) else 0.0
+            sc = (1000.0 if kg else 1.0) if raw_on else (1000.0 if rel.get() else 1.0)
             wdraw = [(t, (v - base) * sc) for t, v in wpts]
             lo, hi = min(v for _, v in wdraw), max(v for _, v in wdraw)
             pad = (hi - lo) * 0.06 or (1 if rel.get() else 0.001); lo -= pad; hi += pad
@@ -130,7 +146,8 @@ def run_plot(parent, data_fn, title='Balance plot', counts_per_c=COUNTS_PER_C, o
             for v in ticks:
                 cv.create_line(ML, yw(v), ML + pw, yw(v), fill='#e4e4e4')
                 cv.create_text(ML - 6, yw(v), text=fmt_num(v, step), anchor='e', fill='#1f5fbf', font=('Helvetica', 10))
-            cv.create_text(14, MT + ph / 2, text='weight change [mg]' if rel.get() else 'weight [g]',
+            cv.create_text(14, MT + ph / 2, text=('raw change [counts]' if not kg else 'raw A/D change [mg]') if raw_on and (rel.get() or not kg) else
+                           ('weight change [mg]' if rel.get() else 'weight [g]'),
                            angle=90, fill='#1f5fbf', font=('Helvetica', 11))
             cv.create_line(*[c for t, v in wdraw for c in (tx(t), yw(v))], fill='#1f5fbf', width=1.5) if len(wdraw) > 1 else None
         # --- temperature series (right axis)
@@ -178,7 +195,7 @@ def run_plot(parent, data_fn, title='Balance plot', counts_per_c=COUNTS_PER_C, o
         if c is not None: txt += f'   T {c:.0f}'
         readout.config(text=txt)
     cv.bind('<Motion>', hover); cv.bind('<Configure>', draw)
-    for var in (span, rel, temp_mode, cpc): var.trace_add('write', lambda *a: draw())
+    for var in (span, rel, temp_mode, cpc, use_raw, cpg): var.trace_add('write', lambda *a: draw())
 
     def tick():
         try:
@@ -196,7 +213,7 @@ def main():
     ap.add_argument('--counts-per-c', type=float, default=COUNTS_PER_C)
     ap.add_argument('--png', help='write the plot to this PostScript file and exit (for scripts)')
     a = ap.parse_args()
-    data = load_csv(a.log) if a.log else ([], [], [], [])
+    data = load_csv(a.log) if a.log else ([], [], [], [], [], [])
     w = run_plot(None, lambda: data, 'Balance plot' + (f' - {a.log}' if a.log else ''), a.counts_per_c)
     if a.png:
         w.update(); w.after(300, lambda: (w.children[list(w.children)[-1]].postscript(file=a.png, colormode='color'), w.destroy()))
